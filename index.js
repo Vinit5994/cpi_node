@@ -33,18 +33,26 @@ const client = new ApolloClient({
 });
 // MongoDB Schema
 const delegateSchema = new mongoose.Schema({
-    delegate: { type: String, required: true, unique: true },
-    voting_power: { type: Number, default: 0 },
-    th_vp: { type: Number, default: 0 },
-    updatedAt: { type: Date, default: Date.now }
-  });
+  date: { type: Date, required: true },
+  delegate_id: { type: String, required: true },
+  voting_power: {
+    vp: { type: Number, required: true },
+    th_vp: { type: Number, required: true }
+  }
+}, {
+  timestamps: true,
+  // Create a compound index on delegate_id and date for efficient queries
+  indexes: [
+    { delegate_id: 1, date: 1 }
+  ]
+});
   
   const Delegate = mongoose.model('Delegate', delegateSchema);
   
   // MongoDB connection function
   async function connectToMongoDB() {
     try {
-      await mongoose.connect('mongodb://localhost:27017/CPI', {
+      await mongoose.connect(process.env.MONGO_URI, {
         useNewUrlParser: true,
         useUnifiedTopology: true
       });
@@ -145,108 +153,125 @@ async function handleVotingPowerUpdate(address) {
 const delegateStore = new DelegateStore();
 
 
+
 // Function to update percentages for all delegates
 async function updateAllPercentages() {
-    try {
-      // Calculate total voting power
-      const totalVotingPower = await Delegate.aggregate([
-        { $group: { _id: null, total: { $sum: "$voting_power" } } }
-      ]);
-      
-      const total = totalVotingPower[0]?.total || 0;
-      
-      // Update all delegates with new percentages
-      await Delegate.updateMany({}, [
-        {
+  try {
+    // Calculate total voting power
+    const totalVotingPower = await Delegate.aggregate([
+      {
+        $group: {
+          _id: null,
+          total: { $sum: "$voting_power.vp" }
+        }
+      }
+    ]);
+
+    const total = totalVotingPower[0]?.total || 0;
+
+    // Update all delegates with new percentages
+    const delegates = await Delegate.find({});
+    
+    const bulkOps = delegates.map(delegate => ({
+      updateOne: {
+        filter: { delegate_id: delegate.delegate_id },
+        update: {
           $set: {
-            th_vp: {
-              $multiply: [{ $divide: ["$voting_power", total] }, 100]
-            }
+            'voting_power.th_vp': (delegate.voting_power.vp / total) * 100
           }
         }
-      ]);
-    } catch (error) {
-      console.error('Error updating percentages:', error);
-    }
-  }
+      }
+    }));
 
+    if (bulkOps.length > 0) {
+      await Delegate.bulkWrite(bulkOps);
+    }
+
+  } catch (error) {
+    console.error('Error updating percentages:', error);
+  }
+}
+
+  
 async function handleDelegateChanged(event) {
-    try {
-      // Get all relevant addresses from the event
-      const delegator = event.returnValues.delegator;
-      const fromDelegate = event.returnValues.fromDelegate;
-      const toDelegate = event.returnValues.toDelegate;
-  
-      console.log('\nDelegate Change Event Detected:');
-      console.log('--------------------------------');
-      console.log(`Transaction Hash: ${event.transactionHash}`);
-      console.log(`Block Number: ${event.blockNumber}`);
-      console.log(`Delegator: ${delegator}`);
-      console.log(`From Delegate: ${fromDelegate}`);
-      console.log(`To Delegate: ${toDelegate}`);
-  
-      // Fetch additional data for all involved addresses
-      const [fromDelegateData, toDelegateData] = await Promise.all([
-        fetchDelegateFromGraph(fromDelegate),
-        fetchDelegateFromGraph(toDelegate)
-      ]);
-console.log('Delegates fetched from The Graph');
-console.log(fromDelegateData, toDelegateData);
-      
-    // Update or create delegates in MongoDB
-    if (fromDelegateData) {
-        await Delegate.findOneAndUpdate(
-          { delegate: fromDelegate },
-          { 
-            voting_power: parseFloat(fromDelegateData.latestBalance/10**18),
-            updatedAt: new Date()
-          },
-          { upsert: true }
-        );
-      }
-  
-      if (toDelegateData) {
-        await Delegate.findOneAndUpdate(
-          { delegate: toDelegate },
-          {
-            voting_power: parseFloat(toDelegateData.latestBalance/10**18),
-            updatedAt: new Date()
-          },
-          { upsert: true }
-        );
-      }
-  console.log('Delegates updated in MongoDB');
-      // Update percentages for all delegates
-      await updateAllPercentages();
-  
-      // Log updated delegate information
-      const [updatedFromDelegate, updatedToDelegate] = await Promise.all([
-        Delegate.findOne({ delegate: fromDelegate }),
-        Delegate.findOne({ delegate: toDelegate })
-      ]);
-  
-      // Log detailed information
-      console.log('\nDetailed Delegate Information:');
-      console.log('-----------------------------');
-      console.log('updatedFromDelegate', updatedFromDelegate);
-      console.log('updatedToDelegate', updatedToDelegate);
-      if (updatedFromDelegate) {
-        console.log(`\nFrom Delegate (${fromDelegate}):`);
-        console.log(`- Voting Power: ${updatedFromDelegate.voting_power}`);
-        console.log(`- Percentage: ${updatedFromDelegate.th_vp.toFixed(5)}%`);
-      }
-  
-      if (updatedToDelegate) {
-        console.log(`\nTo Delegate (${toDelegate}):`);
-        console.log(`- Voting Power: ${updatedToDelegate.voting_power}`);
-        console.log(`- Percentage: ${updatedToDelegate.th_vp.toFixed(5)}%`);
-      }
-  
-    } catch (error) {
-      console.error('Error handling delegate changed event:', error);
-    }
-  }
+  try {
+    const delegator = event.returnValues.delegator;
+    const fromDelegate = event.returnValues.fromDelegate;
+    const toDelegate = event.returnValues.toDelegate;
 
+    console.log('\nDelegate Change Event Detected:');
+    console.log('--------------------------------');
+    console.log(`Transaction Hash: ${event.transactionHash}`);
+    console.log(`Block Number: ${event.blockNumber}`);
+    console.log(`Delegator: ${delegator}`);
+    console.log(`From Delegate: ${fromDelegate}`);
+    console.log(`To Delegate: ${toDelegate}`);
+
+    const [fromDelegateData, toDelegateData] = await Promise.all([
+      fetchDelegateFromGraph(fromDelegate),
+      fetchDelegateFromGraph(toDelegate)
+    ]);
+
+    console.log('Delegates fetched from The Graph');
+    console.log(fromDelegateData, toDelegateData);
+
+    // Update or create delegates in MongoDB with new schema
+    if (fromDelegateData) {
+      await Delegate.findOneAndUpdate(
+        { delegate_id: fromDelegate },
+        {
+          voting_power: {
+            vp: parseFloat(fromDelegateData.latestBalance/10**18),
+            th_vp: 0 // This will be updated by updateAllPercentages
+          }
+        },
+        { upsert: true }
+      );
+    }
+
+    if (toDelegateData) {
+      await Delegate.findOneAndUpdate(
+        { delegate_id: toDelegate },
+        {
+          voting_power: {
+            vp: parseFloat(toDelegateData.latestBalance/10**18),
+            th_vp: 0 // This will be updated by updateAllPercentages
+          }
+        },
+        { upsert: true }
+      );
+    }
+
+    console.log('Delegates updated in MongoDB');
+    
+    // Update percentages for all delegates
+    await updateAllPercentages();
+
+    // Log updated delegate information
+    const [updatedFromDelegate, updatedToDelegate] = await Promise.all([
+      Delegate.findOne({ delegate_id: fromDelegate }),
+      Delegate.findOne({ delegate_id: toDelegate })
+    ]);
+
+    // Log detailed information
+    console.log('\nDetailed Delegate Information:');
+    console.log('-----------------------------');
+    if (updatedFromDelegate) {
+      console.log(`\nFrom Delegate (${fromDelegate}):`);
+      console.log(`- Voting Power: ${updatedFromDelegate.voting_power.vp}`);
+      console.log(`- Percentage: ${updatedFromDelegate.voting_power.th_vp.toFixed(5)}%`);
+    }
+
+    if (updatedToDelegate) {
+      console.log(`\nTo Delegate (${toDelegate}):`);
+      console.log(`- Voting Power: ${updatedToDelegate.voting_power.vp}`);
+      console.log(`- Percentage: ${updatedToDelegate.voting_power.th_vp.toFixed(5)}%`);
+    }
+
+  } catch (error) {
+    console.error('Error handling delegate changed event:', error);
+  }
+}
 // Main function to start monitoring
 async function startMonitoring() {
   try {
@@ -268,16 +293,7 @@ async function startMonitoring() {
         }
         handleDelegateChanged(event);
       });
-      // const event2 = {
-      //   returnValues: {
-      //     delegator: "0x",
-      //     fromDelegate: "0x1b686ee8e31c5959d9f5bbd8122a58682788eead",
-      //     toDelegate: "0x3eee61b92c36e97be6319bf9096a1ac3c04a1466"
-      //   },
-      //   transactionHash: '123',
-      //   blockNumber: '1234'
-      // }
-      //   handleDelegateChanged(event2);
+
     console.log('Monitoring system is running...');
     
     // Optional: Periodic full refresh to catch any missed updates
