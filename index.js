@@ -31,6 +31,30 @@ const client = new ApolloClient({
     }
   }
 });
+// Add reconnection logic for web3 and MongoDB
+function setupWebSocketReconnection() {
+  web3.currentProvider.on('error', async (error) => {
+    console.error('Web3 Provider Error:', error);
+    try {
+      // Attempt to reconnect
+      web3.setProvider(new Web3.providers.WebsocketProvider(config.wsProvider));
+    } catch (reconnectError) {
+      console.error('Web3 Reconnection Failed:', reconnectError);
+    }
+  });
+}
+
+function setupMongoReconnection() {
+  mongoose.connection.on('error', (error) => {
+    console.error('MongoDB Connection Error:', error);
+    setTimeout(connectToMongoDB, 5000); // Retry connection after 5 seconds
+  });
+
+  mongoose.connection.on('disconnected', () => {
+    console.log('MongoDB Disconnected. Attempting to reconnect...');
+    setTimeout(connectToMongoDB, 5000);
+  });
+}
 // MongoDB Schema
 const delegateSchema = new mongoose.Schema({
   date: { type: Date, required: true },
@@ -41,6 +65,7 @@ const delegateSchema = new mongoose.Schema({
   }
 }, {
   timestamps: true,
+  collection: 'delegate_data', // Explicitly set the collection name
   // Create a compound index on delegate_id and date for efficient queries
   indexes: [
     { delegate_id: 1, date: 1 }
@@ -53,16 +78,16 @@ const delegateSchema = new mongoose.Schema({
   async function connectToMongoDB() {
     try {
       await mongoose.connect(process.env.MONGO_URI, {
+        dbName: 'CPI', // Specify the database name here
         useNewUrlParser: true,
-        useUnifiedTopology: true
+        useUnifiedTopology: true,
       });
-      console.log('Connected to MongoDB');
+      console.log('Connected to MongoDB - CPI database');
     } catch (error) {
       console.error('MongoDB connection error:', error);
       throw error;
     }
-  }  
-
+  }
 // Initialize Web3
 const web3 = new Web3(new Web3.providers.WebsocketProvider(config.wsProvider));
 
@@ -85,10 +110,10 @@ class DelegateStore {
   // Recalculate percentages for all delegates
   updatePercentages() {
     this.totalVotingPower = Array.from(this.delegates.values())
-      .reduce((sum, delegate) => sum + delegate.votingPower, 0);
-
+      .reduce((sum, delegate) => sum + delegate.voting_power.vp, 0);
+console.log('voting power...',this.totalVotingPower);
     for (const delegate of this.delegates.values()) {
-      delegate.th_vp = (delegate.votingPower / this.totalVotingPower) * 100;
+      delegate.th_vp = (delegate.voting_power.vp / this.totalVotingPower) * 100;
     }
   }
 
@@ -154,11 +179,19 @@ const delegateStore = new DelegateStore();
 
 
 
-// Function to update percentages for all delegates
 async function updateAllPercentages() {
   try {
-    // Calculate total voting power
     const totalVotingPower = await Delegate.aggregate([
+      {
+        $match: {
+          "voting_power.vp": { 
+            $exists: true, 
+            $ne: null, 
+            $type: "number", 
+            $not: { $eq: NaN }
+          }
+        }
+      },
       {
         $group: {
           _id: null,
@@ -166,18 +199,27 @@ async function updateAllPercentages() {
         }
       }
     ]);
-
+    
     const total = totalVotingPower[0]?.total || 0;
+    console.log('total voting power...', total);
 
-    // Update all delegates with new percentages
-    const delegates = await Delegate.find({});
+    const delegates = await Delegate.find({
+      "voting_power.vp": { 
+        $exists: true, 
+        $ne: null, 
+        $type: "number", 
+        // $not: { $eq: NaN }
+      }
+    });
     
     const bulkOps = delegates.map(delegate => ({
       updateOne: {
         filter: { delegate_id: delegate.delegate_id },
         update: {
           $set: {
-            'voting_power.th_vp': (delegate.voting_power.vp / total) * 100
+            'voting_power.th_vp': total > 0 
+              ? (delegate.voting_power.vp / total) * 100 
+              : 0
           }
         }
       }
@@ -186,12 +228,10 @@ async function updateAllPercentages() {
     if (bulkOps.length > 0) {
       await Delegate.bulkWrite(bulkOps);
     }
-
   } catch (error) {
     console.error('Error updating percentages:', error);
   }
 }
-
   
 async function handleDelegateChanged(event) {
   try {
@@ -215,32 +255,44 @@ async function handleDelegateChanged(event) {
     console.log('Delegates fetched from The Graph');
     console.log(fromDelegateData, toDelegateData);
 
-    // Update or create delegates in MongoDB with new schema
-    if (fromDelegateData) {
-      await Delegate.findOneAndUpdate(
-        { delegate_id: fromDelegate },
-        {
-          voting_power: {
-            vp: parseFloat(fromDelegateData.latestBalance/10**18),
-            th_vp: 0 // This will be updated by updateAllPercentages
-          }
-        },
-        { upsert: true }
-      );
-    }
-
+   if (fromDelegateData) {
+  const votingPower = parseFloat(fromDelegateData.latestBalance) / 10 ** 18;
+  
+  if (!isNaN(votingPower)) {
+    await Delegate.findOneAndUpdate(
+      { delegate_id: fromDelegate.toLowerCase() },
+      {
+        $set: {
+          "voting_power.vp": votingPower,
+          "voting_power.th_vp": 0 
+        }
+      },
+      { 
+        upsert: false,
+        runValidators: true 
+      }
+    );
+  }
+}
     if (toDelegateData) {
-      await Delegate.findOneAndUpdate(
-        { delegate_id: toDelegate },
-        {
-          voting_power: {
-            vp: parseFloat(toDelegateData.latestBalance/10**18),
-            th_vp: 0 // This will be updated by updateAllPercentages
-          }
-        },
-        { upsert: true }
-      );
-    }
+  const votingPower = parseFloat(toDelegateData.latestBalance) / 10 ** 18;
+  
+  if (!isNaN(votingPower)) {
+    await Delegate.findOneAndUpdate(
+      { delegate_id: toDelegate.toLowerCase() },
+      {
+        $set: {
+          "voting_power.vp": votingPower,
+          "voting_power.th_vp": 0 
+        }
+      },
+      { 
+        upsert: false,
+        runValidators: true 
+      }
+    );
+  }
+}
 
     console.log('Delegates updated in MongoDB');
     
@@ -249,8 +301,8 @@ async function handleDelegateChanged(event) {
 
     // Log updated delegate information
     const [updatedFromDelegate, updatedToDelegate] = await Promise.all([
-      Delegate.findOne({ delegate_id: fromDelegate }),
-      Delegate.findOne({ delegate_id: toDelegate })
+      Delegate.findOne({ delegate_id: fromDelegate.toLowerCase() }),
+      Delegate.findOne({ delegate_id: toDelegate.toLowerCase() })
     ]);
 
     // Log detailed information
@@ -280,7 +332,8 @@ async function startMonitoring() {
     // Load initial delegate data with pagination
     // await delegateStore.loadAllDelegates();
     await connectToMongoDB();
-
+    setupMongoReconnection();
+    setupWebSocketReconnection();
     // Set up contract event listener
     const contract = new web3.eth.Contract(config.contractABI, config.contractAddress);
     
